@@ -376,6 +376,13 @@ func DumpTLS(name string) (_ *tls.ConnectionState, err error) {
 }
 
 func DumpTLSWithConfig(name string, tlsConf *tls.Config) (_ *tls.ConnectionState, err error) {
+	return DumpTLSWithConfigAndDialer(name, tlsConf, defaultDialer{})
+}
+
+// DumpTLSWithConfigAndDialer is DumpTLSWithConfig with a custom Dialer, which
+// lets callers route the connection through an HTTP CONNECT proxy and apply a
+// shared connection deadline.
+func DumpTLSWithConfigAndDialer(name string, tlsConf *tls.Config, d Dialer) (_ *tls.ConnectionState, err error) {
 	// Handle any panics during connection initialization.  Note that we
 	// specifically do *not* want to use errRecover(), as that would turn any
 	// connection errors into ErrBadConns, hiding the real error message from
@@ -383,7 +390,6 @@ func DumpTLSWithConfig(name string, tlsConf *tls.Config) (_ *tls.ConnectionState
 	defer errRecoverNoErrBadConn(&err)
 
 	o := make(values)
-	d := defaultDialer{}
 
 	// A number of defaults are applied here, in this order:
 	//
@@ -464,8 +470,11 @@ func DumpTLSWithConfig(name string, tlsConf *tls.Config) (_ *tls.ConnectionState
 	if err != nil {
 		return nil, err
 	}
-	cn.sslWithConfig(o, tlsConf)
+	// Register cleanup before the SSL negotiation: it panics on a refused
+	// upgrade, in which case a defer registered afterwards would never run
+	// and the connection would leak.
 	defer cn.c.Close()
+	cn.sslWithConfig(o, tlsConf)
 
 	if tlsConn, ok := cn.c.(*tls.Conn); ok {
 		err := tlsConn.Handshake()

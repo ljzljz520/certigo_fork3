@@ -17,16 +17,12 @@ package starttls
 
 import (
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"net"
-	"net/smtp"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/go-ldap/ldap/v3"
 
 	"github.com/square/certigo/starttls/mysql"
 	pq "github.com/square/certigo/starttls/psql"
@@ -34,11 +30,6 @@ import (
 
 // Protocols are the names of supported protocols
 var Protocols = []string{"mysql", "postgres", "psql", "smtp", "ldap", "ftp", "imap"}
-
-type connectResult struct {
-	state *tls.ConnectionState
-	err   error
-}
 
 func tlsConfigForConnect(connectName, connectTo, clientCert, clientKey string) (*tls.Config, **tls.CertificateRequestInfo, error) {
 	var hostname string
@@ -108,152 +99,99 @@ func withDefaultPort(addr string, portN uint16) string {
 }
 
 // GetConnectionState connects to a TLS server, returning the connection state.
-// Currently, startTLSType can be one of "mysql", "postgres" or "psql", or the
-// empty string, which does a normal TLS connection. connectTo specifies the
-// address to connect to. connectName sets SNI. identity sets DB username,
-// SMTP EHLO. connectCert and connectKey are client cert/key.
+// startTLSType can be one of "mysql", "postgres", "psql", "smtp", "ldap",
+// "ftp" or "imap", or the empty string, which does a normal TLS connection.
+// connectTo specifies the address to connect to. connectName sets SNI.
+// identity sets DB username or SMTP EHLO. connectCert and connectKey are
+// client cert/key. Dialing, proxying, the STARTTLS exchange and the TLS
+// handshake all share a single timeout budget, and the connection is closed
+// and recycled before this function returns.
 func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCert, clientKey string, connectProxy *url.URL, timeout time.Duration) (*tls.ConnectionState, *tls.CertificateRequestInfo, error) {
-	var err error
-	var state *tls.ConnectionState
-	var cri **tls.CertificateRequestInfo
-	var tlsConfig *tls.Config
-
-	var dialer Dialer = &net.Dialer{
-		Timeout:  timeout,
-		Deadline: time.Now().Add(timeout),
-	}
-
-	// Never take longer than timeout
-	res := make(chan connectResult, 1)
-	go func() {
-		<-time.After(timeout)
-		res <- connectResult{nil, errors.New("timed out")}
-	}()
-
-	tlsConfig, cri, err = tlsConfigForConnect(connectName, connectTo, clientCert, clientKey)
+	tlsConfig, cri, err := tlsConfigForConnect(connectName, connectTo, clientCert, clientKey)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// One absolute deadline bounds the whole connection lifecycle: TCP
+	// establishment, the optional proxy CONNECT tunnel, the plaintext
+	// STARTTLS exchange and the TLS handshake. It is enforced as a socket
+	// deadline rather than a watchdog goroutine, so a timed-out attempt leaves
+	// neither blocked goroutines nor half-open connections behind.
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+
+	netDialer := newNetDialer(timeout, deadline)
+	var dialer Dialer = netDialer
 	if connectProxy != nil {
-		dialer, err = wrapDialerWithProxy(dialer, connectProxy, tlsConfig)
+		dialer, err = wrapDialerWithProxy(netDialer, connectProxy, tlsConfig)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 
-	go func() {
-		switch startTLSType {
-		case "":
-			addr := withDefaultPort(connectTo, 443)
-			conn, err := dialWithDialer(dialer, timeout, "tcp", addr, tlsConfig)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			defer func() { _ = conn.Close() }()
-			state := conn.ConnectionState()
-			res <- connectResult{&state, nil}
-		case "ldap":
-			addr := withDefaultPort(connectTo, 389)
-			nc, err := net.DialTimeout("tcp", addr, timeout)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			l := ldap.NewConn(nc, false)
-			l.Start()
-			defer func() { _ = l.Close() }()
-
-			err = l.StartTLS(tlsConfig)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			s, ok := l.TLSConnectionState()
-			if !ok {
-				res <- connectResult{nil, fmt.Errorf("LDAP connection isn't TLS after StartTLS")}
-				return
-			}
-			state = &s
-			res <- connectResult{state, nil}
-		case "mysql":
-			if err := mysql.RegisterTLSConfig("certigo", tlsConfig); err != nil {
-				res <- connectResult{nil, fmt.Errorf("mysql registration error: %w", err)}
-				return
-			}
-			addr := withDefaultPort(connectTo, 3306)
-			state, err = mysql.DumpTLS(fmt.Sprintf("%s@tcp(%s)/?tls=certigo&timeout=%s", identity, addr, timeout.String()))
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			res <- connectResult{state, nil}
-		case "postgres", "psql":
-			// Setting sslmode to "require" skips verification.
-			addr := withDefaultPort(connectTo, 5432)
-			uri := fmt.Sprintf("postgres://%s@%s/?sslmode=require&connect_timeout=%d", identity, addr, timeout/time.Second)
-			if clientCert != "" {
-				uri += fmt.Sprintf("&sslcert=%s", clientCert)
-			}
-			if clientKey != "" {
-				uri += fmt.Sprintf("&sslkey=%s", clientCert)
-			}
-			state, err = pq.DumpTLSWithConfig(uri, tlsConfig)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			res <- connectResult{state, nil}
-		case "smtp":
-			// Go's net/smtp doesn't support timeouts, so if we hit a timeout we might
-			// leak a Go routine (at least until we hit a lower-level TCP timeout or such).
-			// This is not an issue for Certigo since it's just a short-lived CLI utility.
-			addr := withDefaultPort(connectTo, 25)
-			client, err := smtp.Dial(addr)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			err = client.Hello(identity)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			err = client.StartTLS(tlsConfig)
-			if err != nil {
-				res <- connectResult{nil, err}
-				return
-			}
-			state, ok := client.TLSConnectionState()
-			if !ok {
-				res <- connectResult{nil, errors.New("SMTP connection isn't TLS after StartTLS")}
-			}
-			res <- connectResult{&state, nil}
-		case "ftp":
-			addr := withDefaultPort(connectTo, 21)
-			state, err = dumpTLSConnStateFromFTP(dialer, addr, tlsConfig)
-			res <- connectResult{state, err}
-		case "imap":
-			addr := withDefaultPort(connectTo, 143)
-			state, err = dumpTLSConnStateFromIMAP(dialer, addr, tlsConfig)
-			res <- connectResult{state, err}
-		default:
-			res <- connectResult{nil, fmt.Errorf("unknown StartTLS protocol: %s", startTLSType)}
+	var state *tls.ConnectionState
+	switch startTLSType {
+	case "":
+		addr := withDefaultPort(connectTo, 443)
+		state, err = dialAndUpgrade(dialer, "tcp", addr, tlsConfig, deadline, nil)
+	case "ftp":
+		addr := withDefaultPort(connectTo, 21)
+		state, err = dialAndUpgrade(dialer, "tcp", addr, tlsConfig, deadline, ftpStartTLS())
+	case "imap":
+		addr := withDefaultPort(connectTo, 143)
+		state, err = dialAndUpgrade(dialer, "tcp", addr, tlsConfig, deadline, imapStartTLS())
+	case "smtp":
+		addr := withDefaultPort(connectTo, 25)
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			return nil, nil, splitErr
 		}
-	}()
+		state, err = dialAndUpgrade(dialer, "tcp", addr, tlsConfig, deadline, smtpStartTLS(host, identity))
+	case "ldap":
+		addr := withDefaultPort(connectTo, 389)
+		state, err = dialAndUpgrade(dialer, "tcp", addr, tlsConfig, deadline, ldapStartTLS())
+	case "mysql":
+		if regErr := mysql.RegisterTLSConfig("certigo", tlsConfig); regErr != nil {
+			err = fmt.Errorf("mysql registration error: %w", regErr)
+			break
+		}
+		addr := withDefaultPort(connectTo, 3306)
+		dsn := fmt.Sprintf("%s@tcp(%s)/?tls=certigo&timeout=%s", identity, addr, timeout.String())
+		// The injected dial function routes MySQL through the (possibly
+		// proxying) dialer and applies the shared deadline; the driver keeps
+		// that deadline as long as no per-read/write timeouts are configured.
+		dialFunc := func(addr string) (net.Conn, error) {
+			return dialWithDeadline(dialer, "tcp", addr, deadline)
+		}
+		state, err = mysql.DumpTLS(dsn, dialFunc)
+	case "postgres", "psql":
+		// Setting sslmode to "require" skips verification. No connect_timeout
+		// is passed: the shared deadline applied by the injected dialer also
+		// covers the SSL negotiation and handshake.
+		addr := withDefaultPort(connectTo, 5432)
+		uri := fmt.Sprintf("postgres://%s@%s/?sslmode=require", identity, addr)
+		if clientCert != "" {
+			uri += fmt.Sprintf("&sslcert=%s", clientCert)
+		}
+		if clientKey != "" {
+			uri += fmt.Sprintf("&sslkey=%s", clientCert)
+		}
+		state, err = pq.DumpTLSWithConfigAndDialer(uri, tlsConfig, pqDialerAdapter{dialer: dialer, deadline: deadline})
+	default:
+		err = fmt.Errorf("unknown StartTLS protocol: %s", startTLSType)
+	}
 
-	result := <-res
-
-	if result.err != nil {
-		return nil, nil, fmt.Errorf("error connecting: %v", result.err)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error connecting: %w", err)
 	}
 
 	if cri == nil {
-		return result.state, nil, nil
+		return state, nil, nil
 	}
 
-	if result.state.Version < tls.VersionTLS12 && *cri != nil {
+	if state.Version < tls.VersionTLS12 && *cri != nil {
 		// Sending supported signature schemes was added in TLS 1.2,
 		// but Go lies to us in the GetClientCertificate callback and
 		// gives us fake "supported schemes" even for older versions.
@@ -261,5 +199,5 @@ func GetConnectionState(startTLSType, connectName, connectTo, identity, clientCe
 		(*cri).SignatureSchemes = nil
 	}
 
-	return result.state, *cri, nil
+	return state, *cri, nil
 }

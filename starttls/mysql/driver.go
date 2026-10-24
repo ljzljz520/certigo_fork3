@@ -138,8 +138,10 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 
 // DumpTLS returns a TLS context from a connection to the server. This was was
 // added for use by Certigo in order to make it possible to dump TLS certificates
-// from a MySQL server for debugging.
-func DumpTLS(dsn string) (*tls.ConnectionState, error) {
+// from a MySQL server for debugging. A non-nil dial function is used to
+// establish the underlying connection (e.g. to route it through an HTTP CONNECT
+// proxy or apply a shared connection deadline).
+func DumpTLS(dsn string, dial DialFunc) (*tls.ConnectionState, error) {
 	var err error
 
 	// New mysqlConn
@@ -158,9 +160,12 @@ func DumpTLS(dsn string) (*tls.ConnectionState, error) {
 		return nil, errors.New("certigo/mysql error: TLS must be enabled to dump TLS data")
 	}
 
-	// Connect to Server
-	if dial, ok := dials[mc.cfg.Net]; ok {
+	// Connect to Server. A dial function passed by the caller takes
+	// precedence over registered and built-in dialers.
+	if dial != nil {
 		mc.netConn, err = dial(mc.cfg.Addr)
+	} else if registered, ok := dials[mc.cfg.Net]; ok {
+		mc.netConn, err = registered(mc.cfg.Addr)
 	} else {
 		nd := net.Dialer{Timeout: mc.cfg.Timeout}
 		mc.netConn, err = nd.Dial(mc.cfg.Net, mc.cfg.Addr)
@@ -168,6 +173,10 @@ func DumpTLS(dsn string) (*tls.ConnectionState, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Recycle the connection on every failure path as well as after the TLS
+	// state has been captured.
+	defer mc.cleanup()
 
 	mc.buf = newBuffer(mc.netConn)
 
@@ -238,13 +247,13 @@ func DumpTLS(dsn string) (*tls.ConnectionState, error) {
 
 	// Send TLS / SSL request packet
 	if err := mc.writePacket(data[:pktLen+4]); err != nil {
-		return nil, fmt.Errorf("mysql: %s", err)
+		return nil, fmt.Errorf("mysql: %w", err)
 	}
 
 	// Switch to TLS
 	tlsConn := tls.Client(mc.netConn, mc.cfg.tls)
 	if err := tlsConn.Handshake(); err != nil {
-		return nil, fmt.Errorf("mysql: %s", err)
+		return nil, fmt.Errorf("mysql: %w", err)
 	}
 
 	state := tlsConn.ConnectionState()

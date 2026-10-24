@@ -23,6 +23,13 @@ import (
 // Packets documentation:
 // http://dev.mysql.com/doc/internals/en/client-server-protocol.html
 
+// badConnError marks err as a bad connection (so database/sql retry logic
+// keeps working) while preserving the underlying cause, e.g. a deadline
+// timeout, via errors.As/Is.
+func badConnError(err error) error {
+	return fmt.Errorf("%w: %w", driver.ErrBadConn, err)
+}
+
 // Read packet to buffer 'data'
 func (mc *mysqlConn) readPacket() ([]byte, error) {
 	var prevData []byte
@@ -31,8 +38,10 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		data, err := mc.buf.readNext(4)
 		if err != nil {
 			errLog.Print(err)
-			mc.Close()
-			return nil, driver.ErrBadConn
+			// The handshake/upgrade never completed: recycle the socket
+			// directly, without sending a COM_QUIT over the dead connection.
+			mc.cleanup()
+			return nil, badConnError(err)
 		}
 
 		// packet length [24 bit]
@@ -64,8 +73,8 @@ func (mc *mysqlConn) readPacket() ([]byte, error) {
 		data, err = mc.buf.readNext(pktLen)
 		if err != nil {
 			errLog.Print(err)
-			mc.Close()
-			return nil, driver.ErrBadConn
+			mc.cleanup()
+			return nil, badConnError(err)
 		}
 
 		// return data if this was the last packet
@@ -126,10 +135,12 @@ func (mc *mysqlConn) writePacket(data []byte) error {
 		// Handle error
 		if err == nil { // n != len(data)
 			errLog.Print(ErrMalformPkt)
-		} else {
-			errLog.Print(err)
+			mc.cleanup()
+			return badConnError(ErrMalformPkt)
 		}
-		return driver.ErrBadConn
+		errLog.Print(err)
+		mc.cleanup()
+		return badConnError(err)
 	}
 }
 

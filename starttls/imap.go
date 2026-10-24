@@ -19,48 +19,117 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
+	"strconv"
+	"strings"
 )
 
-func dumpTLSConnStateFromIMAP(dialer Dialer, address string, config *tls.Config) (*tls.ConnectionState, error) {
-	c, err := dialer.Dial("tcp", address)
-	if err != nil {
-		return nil, err
-	}
+const imapStartTLSCommand = "1 STARTTLS"
 
-	conn := c.(*net.TCPConn)
-	status, err := readIMAP(conn)
-	if err != nil {
-		return nil, err
-	}
-	if status != "OK" {
-		return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
-	}
+func imapStartTLS() startTLSFunc {
+	return func(conn net.Conn, config *tls.Config) (*tls.ConnectionState, error) {
+		// A single buffered reader must span the whole plaintext phase: the
+		// greeting can over-read, and creating a new bufio.Reader per response
+		// would silently drop the buffered bytes.
+		reader := bufio.NewReader(conn)
 
-	fmt.Fprintf(conn, "1 STARTTLS\r\n")
-	status, err = readIMAP(conn)
-	if err != nil {
-		return nil, err
-	}
-	if status != "OK" {
-		return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
-	}
+		status, err := readIMAPCompletion(reader, "")
+		if err != nil {
+			return nil, err
+		}
+		if status != "OK" {
+			return nil, fmt.Errorf("IMAP server responded with %s, was expecting OK", status)
+		}
 
-	tlsConn := tls.Client(conn, config)
-	err = tlsConn.Handshake()
-	if err != nil {
-		return nil, err
-	}
+		if _, err := io.WriteString(conn, imapStartTLSCommand+"\r\n"); err != nil {
+			return nil, err
+		}
 
-	state := tlsConn.ConnectionState()
-	return &state, nil
+		status, err = readIMAPCompletion(reader, "1")
+		if err != nil {
+			return nil, err
+		}
+		if status != "OK" {
+			return nil, fmt.Errorf("IMAP server refused STARTTLS with %s response, was expecting OK", status)
+		}
+
+		tlsConn := tls.Client(&bufferedConn{reader: reader, Conn: conn}, config)
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, err
+		}
+
+		state := tlsConn.ConnectionState()
+		return &state, nil
+	}
 }
 
-func readIMAP(conn *net.TCPConn) (string, error) {
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
+// readIMAPCompletion reads complete server responses up to the tagged
+// completion line. Untagged ("*") and continuation ("+") lines, including any
+// {n} literals, are consumed so the plaintext/TLS protocol boundary is
+// respected. An empty tag waits for the server greeting, which is always
+// untagged; a non-empty tag waits for that command's completion.
+func readIMAPCompletion(r *bufio.Reader, tag string) (string, error) {
+	for {
+		line, err := readIMAPLine(r)
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+
+		var token, response string
+		if i := strings.IndexByte(line, ' '); i >= 0 {
+			token, response = line[:i], strings.TrimSpace(line[i+1:])
+		} else {
+			token = line
+		}
+
+		switch {
+		case tag == "" && token == "*":
+			// Server greeting: "* OK ...", "* PREAUTH ..." or "* BYE ...".
+			return firstWord(response), nil
+		case tag != "" && token == tag:
+			// Tagged completion: "1 OK/NO/BAD ...".
+			return firstWord(response), nil
+		default:
+			// Untagged or continuation data preceding the completion;
+			// a greeting, on the other hand, must be untagged.
+			if tag == "" {
+				return "", fmt.Errorf("error parsing IMAP protocol: malformed server greeting: %q", line)
+			}
+		}
+	}
+}
+
+// readIMAPLine returns one CRLF-terminated line, transparently consuming the
+// literal payloads advertised by a trailing "{n}" marker (RFC 3501).
+func readIMAPLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil && line == "" {
 		return "", err
 	}
-	return response[2:4], nil
+
+	trimmed := strings.TrimRight(line, "\r\n")
+	if open := strings.LastIndexByte(trimmed, '{'); open >= 0 && strings.HasSuffix(trimmed, "}") {
+		n, convErr := strconv.Atoi(trimmed[open+1 : len(trimmed)-1])
+		if convErr != nil {
+			return line, err
+		}
+		// The literal data and its trailing CRLF are not part of the reply
+		// line, but must be consumed before parsing continues.
+		if _, copyErr := io.CopyN(io.Discard, r, int64(n)+2); copyErr != nil {
+			return "", copyErr
+		}
+		rest, joinErr := readIMAPLine(r)
+		return line + rest, joinErr
+	}
+
+	return line, err
+}
+
+func firstWord(s string) string {
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
